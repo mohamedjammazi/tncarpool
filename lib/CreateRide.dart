@@ -3,206 +3,376 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
+import 'package:google_mobile_ads/google_mobile_ads.dart';
 import 'package:http/http.dart' as http;
+import 'package:intl/intl.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:flutter_map/flutter_map.dart';
-import 'add_car.dart' as add_car; // Ensure your add_car.dart exists
 
-// Model representing an OSM place
-class OSMPlace {
-  final String displayName;
-  final String name;
-  final LatLng point;
-
-  OSMPlace({
-    required this.displayName,
-    required this.name,
-    required this.point,
-  });
-}
+// Ensure these imports point to the correct files in your project
+import 'add_car.dart' as add_car;
+import 'home_page.dart'; // For navigation
+import 'my_ride_page.dart';
+import 'my_cars.dart';
+import 'chat_list_page.dart';
+// Import the LocationPickerPage you created
+import 'location_picker_page.dart';
+// Import the NEW SeatLayoutWidget you just created
+import 'widgets/seat_layout_widget.dart'; // Adjust path if needed
 
 // ====================== Create Ride Page ======================
 class CreateRidePage extends StatefulWidget {
-  const CreateRidePage({Key? key}) : super(key: key);
+  const CreateRidePage({super.key});
 
   @override
-  _CreateRidePageState createState() => _CreateRidePageState();
+  State<CreateRidePage> createState() => _CreateRidePageState();
 }
 
 class _CreateRidePageState extends State<CreateRidePage> {
+  // --- State Variables and Controllers ---
   final _formKey = GlobalKey<FormState>();
-
-  // Controllers
+  final FirebaseFirestore _firestore = FirebaseFirestore.instance;
+  final FirebaseAuth _auth = FirebaseAuth.instance;
   final TextEditingController _startController = TextEditingController();
   final TextEditingController _destController = TextEditingController();
   final TextEditingController _seatPriceController = TextEditingController();
   final TextEditingController _dateController = TextEditingController();
   final TextEditingController _timeController = TextEditingController();
-
   LatLng? _startLatLng;
   LatLng? _destLatLng;
-
   DateTime? _selectedDate;
   TimeOfDay? _selectedTime;
-
-  // “once”, “daily” or “daysOfWeek”
   String _repeatOption = 'once';
-  List<bool> _weekdaySelected = List<bool>.filled(7, false);
-
-  // Car data from Firestore
+  final List<bool> _weekdaySelected = List<bool>.filled(7, false);
   List<DocumentSnapshot> _cars = [];
   DocumentSnapshot? _selectedCar;
   int _carSeats = 0;
-  // Flat seat layout with “offered” toggles
-  List<Map<String, dynamic>> _seatLayout = [];
-
-  bool _isLoading = true;
+  List<Map<String, dynamic>> _seatLayout = []; // Still managed here
   bool _smokingAllowed = false;
-
-  // For role logic
+  bool _isLoading = true;
+  bool _isSubmitting = false;
   String? _currentUserRole;
-  bool _allowCreateRide = false; // if user is permitted to create a new ride
+  bool _allowCreateRide = false;
   bool _isCheckingRole = true;
+  int _userGold = 0;
+  bool _isUpdatingGold = false;
+  final String _rewardedAdUnitId =
+      'ca-app-pub-3940256099942544/5224354917'; // Test ID
+  RewardedAd? _rewardedAd;
+  bool _isRewardedAdLoading = false;
+  final int _goldRewardAmount = 2;
+  final int _maxAdsPerHour = 10;
+  List<Timestamp> _rewardedAdTimestamps = [];
+  bool _canWatchRewardedAd = true;
+  final int _createRideCost = 5;
+  int _currentIndex = 0;
 
+  // Define asset paths (UPDATE THESE TO MATCH YOUR PROJECT AND FILE EXTENSIONS)
+  final String _driverSeatImagePath =
+      'assets/images/DRIVERSEAT.png'; // Use .png
+  final String _passengerSeatImagePath =
+      'assets/images/PASSENGER SEAT.png'; // Use .png
+
+  // --- Lifecycle Methods ---
   @override
   void initState() {
     super.initState();
-    _checkRoleAndActiveRide(); // checks if user can create ride
-    _initializeUserLocation();
-    _fetchUserCars();
+    _initializePageData();
+    _loadRewardedAd();
   }
 
-  /// Step 1: Check the user role from users doc
-  /// If role=passenger, no create. If role=driver, must ensure no scheduled/ongoing rides
-  /// If role is empty => allow
-  Future<void> _checkRoleAndActiveRide() async {
+  @override
+  void dispose() {
+    _startController.dispose();
+    _destController.dispose();
+    _seatPriceController.dispose();
+    _dateController.dispose();
+    _timeController.dispose();
+    _rewardedAd?.dispose();
+    super.dispose();
+  }
+
+  // --- Initialization Methods ---
+  Future<void> _initializePageData() async {
     setState(() {
       _isLoading = true;
       _isCheckingRole = true;
     });
     try {
-      final currentUser = FirebaseAuth.instance.currentUser;
+      // Run checks and fetches concurrently where possible
+      await Future.wait([
+        _checkRoleAndActiveRide(), // Checks role and if driver has active ride
+        _fetchUserCars(), // Fetches user's cars
+        _fetchUserData(), // Fetches gold and ad timestamps
+      ]);
+      // Fetch initial location after core data is loaded
+      if (mounted) {
+        await _initializeUserLocation();
+      }
+    } catch (e) {
+      debugPrint("Error initializing page data: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Error loading page data: ${e.toString()}")),
+        );
+        // Handle error state appropriately, maybe block ride creation
+        setState(() => _allowCreateRide = false);
+      }
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isLoading = false;
+          _isCheckingRole = false; // Ensure this is set false even on error
+        });
+      }
+    }
+  }
+
+  Future<void> _checkRoleAndActiveRide() async {
+    bool canCreate = false;
+    try {
+      final currentUser = _auth.currentUser;
       if (currentUser == null) {
-        // no user => no creation
-        _currentUserRole = "";
-        _allowCreateRide = false;
+        _currentUserRole = ""; // No user logged in
       } else {
         final userDoc =
-            await FirebaseFirestore.instance
-                .collection('users')
-                .doc(currentUser.uid)
-                .get();
+            await _firestore.collection('users').doc(currentUser.uid).get();
         if (!userDoc.exists) {
-          // no doc => new user
-          _currentUserRole = "";
-          _allowCreateRide = true;
+          _currentUserRole = ""; // User doc doesn't exist yet
+          canCreate =
+              true; // Allow creation for new users (assuming they add car)
         } else {
           final data = userDoc.data() as Map<String, dynamic>;
           _currentUserRole = data['role'] as String? ?? "";
-          if (_currentUserRole == null || _currentUserRole!.isEmpty) {
-            // role empty => can create
-            _allowCreateRide = true;
+
+          if (_currentUserRole!.isEmpty) {
+            canCreate = true; // Role not set, allow creation
           } else if (_currentUserRole == "passenger") {
-            // If they're passenger => can they create a ride? By logic, no
-            _allowCreateRide = false;
+            canCreate = false; // Passengers cannot create rides
           } else if (_currentUserRole == "driver") {
-            // If they're driver => check if they have an uncompleted ride
+            // Drivers can create only if they don't have an active ride
             bool hasUnfinishedRide = await _checkUnfinishedRide(
               currentUser.uid,
             );
-            if (hasUnfinishedRide) {
-              _allowCreateRide = false;
-            } else {
-              _allowCreateRide = true;
-            }
+            canCreate = !hasUnfinishedRide;
           } else {
-            // if there's other role (like "blocked"?), fallback
-            _allowCreateRide = false;
+            canCreate = false; // Other roles (e.g., 'blocked') cannot create
           }
         }
       }
     } catch (e) {
-      debugPrint("Error checking role: $e");
-      _allowCreateRide = false;
+      debugPrint("Error checking role/active ride: $e");
+      canCreate = false; // Default to false on error
     } finally {
-      setState(() {
-        _isLoading = false;
-        _isCheckingRole = false;
-      });
+      if (mounted) {
+        setState(() {
+          _allowCreateRide = canCreate;
+        });
+      }
     }
   }
 
-  /// Step 2: If user is driver, check if they have a ride with status= "scheduled" or "ongoing"
   Future<bool> _checkUnfinishedRide(String userId) async {
-    final query =
-        await FirebaseFirestore.instance
-            .collection('rides')
-            .where('driverId', isEqualTo: userId)
-            .where('status', whereIn: ["scheduled", "ongoing"])
-            .limit(1)
-            .get();
-    return query.docs.isNotEmpty;
+    try {
+      final query =
+          await _firestore
+              .collection('rides')
+              .where('driverId', isEqualTo: userId)
+              .where('status', whereIn: ["scheduled", "ongoing"])
+              .limit(1)
+              .get();
+      return query.docs.isNotEmpty;
+    } catch (e) {
+      debugPrint("Error checking unfinished ride: $e");
+      return true; // Assume unfinished ride exists on error to be safe
+    }
   }
 
-  Future<void> _initializeUserLocation() async {
-    // your existing location logic
-    bool serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      await showDialog(
+  Future<void> _fetchUserCars() async {
+    final user = _auth.currentUser;
+    if (user == null) {
+      if (mounted) setState(() => _cars = []);
+      return;
+    }
+    try {
+      final carSnapshot =
+          await _firestore
+              .collection('cars')
+              .where('ownerId', isEqualTo: user.uid)
+              .get();
+      if (!mounted) return;
+      if (carSnapshot.docs.isEmpty) {
+        setState(() => _cars = []);
+        _promptToAddCar();
+      } else {
+        setState(() {
+          _cars = carSnapshot.docs;
+          if (_cars.isNotEmpty) {
+            _selectedCar = _cars.first;
+            _updateSeatLayoutFromSelectedCar();
+          }
+        });
+      }
+    } catch (e) {
+      debugPrint("Error fetching user cars: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text("Error fetching cars: ${e.toString()}")),
+        );
+        setState(() => _cars = []);
+      }
+    }
+  }
+
+  Future<void> _fetchUserData() async {
+    try {
+      final user = _auth.currentUser;
+      if (user == null) {
+        if (mounted)
+          setState(() {
+            _userGold = 0;
+            _rewardedAdTimestamps = [];
+            _checkAdLimit();
+          });
+        return;
+      }
+      final userDoc = await _firestore.collection('users').doc(user.uid).get();
+      if (mounted && userDoc.exists) {
+        final data = userDoc.data() ?? {};
+        final fetchedGold = (data['gold'] ?? 0).toInt();
+        final fetchedTimestamps = List<Timestamp>.from(
+          data['rewardedAdTimestamps'] ?? [],
+        );
+        if (mounted) {
+          setState(() {
+            _userGold = fetchedGold;
+            _rewardedAdTimestamps = fetchedTimestamps;
+          });
+          _checkAdLimit();
+        }
+      } else if (mounted) {
+        setState(() {
+          _userGold = 0;
+          _rewardedAdTimestamps = [];
+          _checkAdLimit();
+        });
+      }
+    } catch (e) {
+      debugPrint("Error fetching user data (gold/timestamps): $e");
+      if (mounted) {
+        /* Optional: Show error */
+        _checkAdLimit();
+      }
+    }
+  }
+
+  void _promptToAddCar() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      showDialog(
         context: context,
         barrierDismissible: false,
         builder:
-            (_) => AlertDialog(
-              title: const Text('الخدمات الموقعية غير مفعلة'),
-              content: const Text('يرجى تفعيل خدمات تحديد الموقع...'),
+            (ctx) => AlertDialog(
+              title: const Text('لم يتم العثور على سيارات'),
+              content: const Text('يجب إضافة سيارة قبل إنشاء رحلة.'),
               actions: [
                 TextButton(
-                  onPressed: () async {
-                    await Geolocator.openLocationSettings();
+                  onPressed: () {
+                    Navigator.of(ctx).pop();
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => const add_car.AddCarPage(),
+                      ),
+                    ).then((_) => _fetchUserCars());
+                  },
+                  child: const Text('إضافة سيارة'),
+                ),
+                TextButton(
+                  onPressed: () {
+                    Navigator.of(ctx).pop();
                     Navigator.of(context).pop();
                   },
-                  child: const Text('افتح الإعدادات'),
+                  child: const Text('إلغاء'),
                 ),
               ],
             ),
       );
+    });
+  }
+
+  Future<void> _initializeUserLocation() async {
+    bool serviceEnabled;
+    LocationPermission permission;
+    serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Please enable location services.')),
+      );
+      return;
     }
-    LocationPermission permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied ||
-        permission == LocationPermission.deniedForever) {
+    permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied && mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Location permissions denied.')),
+        );
+        return;
+      }
+    }
+    if (permission == LocationPermission.deniedForever && mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Location permissions permanently denied.'),
+        ),
+      );
+      return;
     }
     try {
       final pos = await Geolocator.getCurrentPosition();
+      if (!mounted) return;
       final currentPoint = LatLng(pos.latitude, pos.longitude);
       final placeName = await _reverseGeocode(currentPoint);
       setState(() {
         _startLatLng = currentPoint;
-        _startController.text = placeName ?? "الموقع الحالي";
+        _startController.text = placeName ?? "Current Location";
       });
     } catch (e) {
-      debugPrint("Error init location: $e");
+      debugPrint("Error getting initial location: $e");
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Could not get current location: $e')),
+        );
     }
   }
 
   Future<String?> _reverseGeocode(LatLng point) async {
+    // ** IMPORTANT: Replace User-Agent **
     final url = Uri.parse(
-      "https://nominatim.openstreetmap.org/reverse?format=json&lat=${point.latitude}&lon=${point.longitude}&accept-language=ar&addressdetails=1",
+      "https://nominatim.openstreetmap.org/reverse?format=json&lat=${point.latitude}&lon=${point.longitude}&accept-language=ar,en&addressdetails=1",
     );
     try {
       final response = await http.get(
         url,
-        headers: {"User-Agent": "FlutterRideApp/1.0"},
-      );
+        headers: {"User-Agent": "com.example.carpooling_app/1.0"},
+      ); // ** USE YOURS **
       if (response.statusCode == 200) {
         final data = json.decode(utf8.decode(response.bodyBytes));
-        final address = data['address'] ?? {};
-        final city =
+        final address = data['address'] as Map<String, dynamic>? ?? {};
+        String name =
+            address['road'] ??
+            address['neighbourhood'] ??
+            address['suburb'] ??
             address['city'] ??
             address['town'] ??
             address['village'] ??
-            address['county'];
-        return city ?? data['display_name'];
+            '';
+        if (name.isEmpty) name = data['display_name'] ?? 'Unknown Location';
+        return name.split(',')[0].trim();
+      } else {
+        debugPrint("Reverse geocoding failed: Status ${response.statusCode}");
       }
     } catch (e) {
       debugPrint("Reverse geocoding error: $e");
@@ -210,121 +380,9 @@ class _CreateRidePageState extends State<CreateRidePage> {
     return null;
   }
 
-  Future<void> _fetchUserCars() async {
-    setState(() {
-      _isLoading = true;
-    });
-    final user = FirebaseAuth.instance.currentUser;
-    if (user != null) {
-      final carSnapshot =
-          await FirebaseFirestore.instance
-              .collection('cars')
-              .where('ownerId', isEqualTo: user.uid)
-              .get();
-      if (carSnapshot.docs.isEmpty) {
-        setState(() {
-          _isLoading = false;
-        });
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          showDialog(
-            context: context,
-            barrierDismissible: false,
-            builder: (ctx) {
-              return AlertDialog(
-                title: const Text('لم يتم العثور على سيارات'),
-                content: const Text('يجب إضافة سيارة قبل إنشاء رحلة.'),
-                actions: [
-                  TextButton(
-                    onPressed: () {
-                      Navigator.of(ctx).pop();
-                      Navigator.pushReplacement(
-                        context,
-                        MaterialPageRoute(
-                          builder: (ctx2) => add_car.AddCarPage(),
-                        ),
-                      );
-                    },
-                    child: const Text('إضافة سيارة'),
-                  ),
-                ],
-              );
-            },
-          );
-        });
-      } else {
-        setState(() {
-          _cars = carSnapshot.docs;
-          _isLoading = false;
-          if (_cars.isNotEmpty) {
-            _selectedCar = _cars.first;
-            _carSeats = _selectedCar!['seatCount'];
-            _seatLayout = _generateFlatSeatLayout(_carSeats);
-          }
-        });
-      }
-    } else {
-      setState(() {
-        _isLoading = false;
-      });
-    }
-  }
-
-  void _onCarSelected(DocumentSnapshot carDoc) {
-    setState(() {
-      _selectedCar = carDoc;
-      _carSeats = carDoc['seatCount'];
-      _seatLayout = _generateFlatSeatLayout(_carSeats);
-    });
-  }
-
-  /// Generates the seat layout with "offered" field.
-  /// This is unchanged from previous seat generation logic
-  List<Map<String, dynamic>> _generateFlatSeatLayout(int seats) {
-    final Map<int, List<int>> layoutMapping = {
-      2: [2],
-      4: [2, 2],
-      5: [2, 3],
-      6: [2, 2, 2],
-      7: [2, 3, 2],
-      8: [2, 3, 3],
-      9: [2, 3, 4],
-      10: [2, 4, 4],
-    };
-    final flatLayout = <Map<String, dynamic>>[];
-    final config = layoutMapping[seats] ?? [seats];
-    int seatIndex = 0;
-    for (int row = 0; row < config.length; row++) {
-      final count = config[row];
-      for (int col = 0; col < count; col++) {
-        if (seatIndex == 0) {
-          // driver seat
-          flatLayout.add({
-            "seatIndex": seatIndex,
-            "row": row,
-            "col": col,
-            "type": "driver",
-            "offered": false,
-            "bookedBy": null,
-            "approvalStatus": "pending",
-          });
-        } else {
-          flatLayout.add({
-            "seatIndex": seatIndex,
-            "row": row,
-            "col": col,
-            "type": "share",
-            "offered": false, // toggled in UI
-            "bookedBy": null,
-            "approvalStatus": "pending",
-          });
-        }
-        seatIndex++;
-      }
-    }
-    return flatLayout;
-  }
-
+  // --- Form Input Handlers ---
   Future<void> _openLocationPicker({required bool forStart}) async {
+    if (!mounted) return;
     final result = await Navigator.of(context).push(
       MaterialPageRoute(
         builder:
@@ -333,16 +391,22 @@ class _CreateRidePageState extends State<CreateRidePage> {
             ),
       ),
     );
-    if (result != null && result is Map<String, dynamic>) {
-      setState(() {
-        if (forStart) {
-          _startLatLng = LatLng(result['lat'], result['lon']);
-          _startController.text = result['name'];
-        } else {
-          _destLatLng = LatLng(result['lat'], result['lon']);
-          _destController.text = result['name'];
-        }
-      });
+    if (result != null && result is Map<String, dynamic> && mounted) {
+      final lat = result['lat'] as double?;
+      final lon = result['lon'] as double?;
+      final name = result['name'] as String?;
+      if (lat != null && lon != null && name != null) {
+        setState(() {
+          final pickedLatLng = LatLng(lat, lon);
+          if (forStart) {
+            _startLatLng = pickedLatLng;
+            _startController.text = name;
+          } else {
+            _destLatLng = pickedLatLng;
+            _destController.text = name;
+          }
+        });
+      }
     }
   }
 
@@ -350,760 +414,1085 @@ class _CreateRidePageState extends State<CreateRidePage> {
     final now = DateTime.now();
     final date = await showDatePicker(
       context: context,
-      initialDate: now,
+      initialDate: _selectedDate ?? now,
       firstDate: now,
-      lastDate: DateTime(now.year + 5),
-      locale: const Locale('ar'),
+      lastDate: DateTime(now.year + 1),
+      locale: const Locale('en', 'US'),
     );
-    if (date != null) {
+    if (date != null && mounted) {
       setState(() {
         _selectedDate = date;
-        _dateController.text = _formatDate(date);
+        _dateController.text = DateFormat('yyyy/MM/dd').format(date);
       });
     }
   }
 
   Future<void> _pickTime() async {
+    final now = TimeOfDay.now();
     final time = await showTimePicker(
       context: context,
-      initialTime: TimeOfDay.now(),
-      builder: (ctx, child) {
-        return MediaQuery(
-          data: MediaQuery.of(ctx).copyWith(alwaysUse24HourFormat: true),
-          child: child ?? const SizedBox(),
-        );
-      },
+      initialTime: _selectedTime ?? now,
+      builder:
+          (ctx, child) => MediaQuery(
+            data: MediaQuery.of(ctx).copyWith(alwaysUse24HourFormat: true),
+            child: child ?? const SizedBox(),
+          ),
     );
-    if (time != null) {
+    if (time != null && mounted) {
       setState(() {
         _selectedTime = time;
-        _timeController.text = _formatTime(time);
+        final hour = time.hour.toString().padLeft(2, '0');
+        final minute = time.minute.toString().padLeft(2, '0');
+        _timeController.text = '$hour:$minute';
       });
     }
   }
 
-  String _formatDate(DateTime date) {
-    return "${date.year}/${date.month.toString().padLeft(2, '0')}/${date.day.toString().padLeft(2, '0')}";
+  void _onCarSelected(DocumentSnapshot? carDoc) {
+    if (carDoc == null) return;
+    setState(() {
+      _selectedCar = carDoc;
+      _updateSeatLayoutFromSelectedCar();
+    });
   }
 
-  String _formatTime(TimeOfDay time) {
-    final h = time.hour.toString().padLeft(2, '0');
-    final m = time.minute.toString().padLeft(2, '0');
-    return "$h:$m";
+  void _updateSeatLayoutFromSelectedCar() {
+    if (_selectedCar == null) return;
+    final data = _selectedCar!.data() as Map<String, dynamic>? ?? {};
+    _carSeats = (data['seatCount'] as int?) ?? 0;
+    _seatLayout = _generateFlatSeatLayout(_carSeats);
   }
 
-  /// UI for seat layout
-  Widget _buildSeatLayout() {
-    // Group seat layout by row
-    final Map<int, List<Map<String, dynamic>>> grouped = {};
-    for (var seat in _seatLayout) {
-      final row = seat["row"] as int;
-      grouped.putIfAbsent(row, () => []);
-      grouped[row]!.add(seat);
+  List<Map<String, dynamic>> _generateFlatSeatLayout(int totalSeats) {
+    if (totalSeats < 1) return [];
+    final List<Map<String, dynamic>> layout = [];
+    layout.add({
+      "seatIndex": 0,
+      "type": "driver",
+      "offered": false,
+      "bookedBy": "n/a",
+      "approvalStatus": "n/a",
+    });
+    for (int i = 1; i < totalSeats; i++) {
+      layout.add({
+        "seatIndex": i,
+        "type": "share",
+        "offered": false,
+        "bookedBy": "n/a",
+        "approvalStatus": "pending",
+      });
     }
-    final sortedKeys = grouped.keys.toList()..sort();
-    final rows = sortedKeys.map((k) => grouped[k]!).toList();
-
-    return Column(
-      children:
-          rows.map((row) {
-            return Padding(
-              padding: const EdgeInsets.symmetric(vertical: 8.0),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children:
-                    row.map((seat) {
-                      return Padding(
-                        padding: const EdgeInsets.symmetric(horizontal: 8.0),
-                        child: _buildSeatIcon(seat),
-                      );
-                    }).toList(),
-              ),
-            );
-          }).toList(),
-    );
+    return layout;
   }
 
-  /// Each seat icon can be toggled "offered" if type=share
-  Widget _buildSeatIcon(Map<String, dynamic> seat) {
-    final seatIndex = seat["seatIndex"] as int;
-    final type = seat["type"] as String;
-    final offered = seat["offered"] == true;
-    String label;
-    IconData icon;
-    Color color;
-
-    if (type == "driver") {
-      label = "سائق";
-      icon = Icons.person;
-      color = Colors.blueAccent;
-    } else {
-      if (offered) {
-        label = "معروض";
-        icon = Icons.event_seat;
-        color = Colors.green;
-      } else {
-        label = "غير معروض";
-        icon = Icons.close;
-        color = Colors.grey;
-      }
+  // --- Rewarded Ad Methods ---
+  void _checkAdLimit() {
+    if (!mounted) return;
+    final now = DateTime.now();
+    final oneHourAgo = now.subtract(const Duration(hours: 1));
+    final recentTimestamps =
+        _rewardedAdTimestamps
+            .where((ts) => ts.toDate().isAfter(oneHourAgo))
+            .toList();
+    final bool canWatch = recentTimestamps.length < _maxAdsPerHour;
+    if (_canWatchRewardedAd != canWatch) {
+      setState(() => _canWatchRewardedAd = canWatch);
     }
+  }
 
-    return InkWell(
-      onTap:
-          type == "driver"
-              ? null
-              : () {
-                setState(() {
-                  seat["offered"] = !seat["offered"];
-                });
-              },
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, color: color, size: 32),
-          const SizedBox(height: 4),
-          Text(label, style: const TextStyle(fontSize: 12)),
-        ],
+  void _loadRewardedAd() {
+    if (_isRewardedAdLoading) return;
+    setState(() => _isRewardedAdLoading = true);
+    RewardedAd.load(
+      adUnitId: _rewardedAdUnitId,
+      request: const AdRequest(),
+      rewardedAdLoadCallback: RewardedAdLoadCallback(
+        onAdLoaded: (RewardedAd ad) {
+          _rewardedAd?.dispose();
+          _rewardedAd = ad;
+          _isRewardedAdLoading = false;
+          _setRewardedAdCallbacks();
+        },
+        onAdFailedToLoad: (LoadAdError error) {
+          debugPrint('Rewarded Ad failed load: $error');
+          _rewardedAd = null;
+          _isRewardedAdLoading = false;
+        },
       ),
     );
   }
 
-  /// Submits the ride. Then sets user role=driver if successful
-  Future<void> _submitRide() async {
-    if (!_allowCreateRide) {
-      // If user not allowed to create, show error
+  void _setRewardedAdCallbacks() {
+    _rewardedAd?.fullScreenContentCallback = FullScreenContentCallback(
+      onAdShowedFullScreenContent: (ad) => print('Ad showed.'),
+      onAdDismissedFullScreenContent: (ad) {
+        ad.dispose();
+        _rewardedAd = null;
+        _loadRewardedAd();
+      },
+      onAdFailedToShowFullScreenContent: (ad, err) {
+        print('Ad failed show: $err');
+        ad.dispose();
+        _rewardedAd = null;
+        _loadRewardedAd();
+      },
+      onAdImpression: (ad) => print('Ad impression.'),
+    );
+  }
+
+  void _showRewardedAd() {
+    _checkAdLimit();
+    if (!_canWatchRewardedAd) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("لا يمكنك إنشاء رحلة الآن.")),
+        SnackBar(
+          content: Text(
+            'You have reached the limit of $_maxAdsPerHour rewarded ads per hour. Please try again later.',
+          ),
+          backgroundColor: Colors.orange.shade800,
+        ),
       );
       return;
     }
+    if (_rewardedAd == null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Reward ad not ready. Loading... Please try again shortly.',
+          ),
+        ),
+      );
+      if (!_isRewardedAdLoading) _loadRewardedAd();
+      return;
+    }
+    _setRewardedAdCallbacks();
+    _rewardedAd!.show(onUserEarnedReward: (ad, reward) => _grantGoldReward());
+    _rewardedAd = null;
+  }
 
+  Future<void> _grantGoldReward() async {
+    if (!mounted) return;
+    setState(() => _isUpdatingGold = true);
+    final Timestamp currentTime = Timestamp.now();
+    try {
+      final user = _auth.currentUser;
+      if (user == null) throw Exception("User not logged in");
+      final userRef = _firestore.collection('users').doc(user.uid);
+      await userRef.update({
+        'gold': FieldValue.increment(_goldRewardAmount),
+        'rewardedAdTimestamps': FieldValue.arrayUnion([currentTime]),
+      });
+      if (mounted) {
+        setState(() {
+          _userGold += _goldRewardAmount;
+          _rewardedAdTimestamps.add(currentTime);
+          _isUpdatingGold = false;
+        });
+        _checkAdLimit();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('$_goldRewardAmount Gold Added! Total: $_userGold'),
+            backgroundColor: Colors.green,
+          ),
+        );
+      }
+    } catch (e) {
+      debugPrint("Error updating gold/timestamp after reward: $e");
+      if (mounted) setState(() => _isUpdatingGold = false);
+      _fetchUserData();
+    }
+  }
+
+  // --- Gold Cost Handling ---
+  Future<bool> _handleCreateRideGoldCost() async {
+    if (_userGold < _createRideCost) {
+      if (!mounted) return false;
+      final watchAd = await showDialog<bool>(
+        context: context,
+        barrierDismissible: false,
+        builder:
+            (context) => AlertDialog(
+              title: const Text('Insufficient Gold'),
+              content: Text(
+                'Creating a ride costs $_createRideCost gold. You have $_userGold.\n\nWatch an ad to earn $_goldRewardAmount gold?',
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(false),
+                  child: const Text('Cancel'),
+                ),
+                TextButton(
+                  style: TextButton.styleFrom(foregroundColor: Colors.green),
+                  onPressed: () => Navigator.of(context).pop(true),
+                  child: const Text('Watch Ad & Earn'),
+                ),
+              ],
+            ),
+      );
+      if (watchAd == true && mounted) {
+        _showRewardedAd();
+      }
+      return false;
+    } else {
+      if (!mounted) return false;
+      setState(() => _isUpdatingGold = true);
+      try {
+        final user = _auth.currentUser;
+        if (user == null) throw Exception("User not logged in");
+        final userRef = _firestore.collection('users').doc(user.uid);
+        await userRef.update({'gold': FieldValue.increment(-_createRideCost)});
+        if (mounted) {
+          setState(() {
+            _userGold -= _createRideCost;
+            _isUpdatingGold = false;
+          });
+          return true;
+        }
+        return false;
+      } catch (e) {
+        debugPrint("Error deducting gold for ride creation: $e");
+        if (mounted) {
+          setState(() => _isUpdatingGold = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Error processing payment: $e'),
+              backgroundColor: Colors.red,
+            ),
+          );
+          _fetchUserData();
+        }
+        return false;
+      }
+    }
+  }
+
+  // --- Ride Submission ---
+  Future<void> _submitRide() async {
+    // 1. Validate Form
+    if (!(_formKey.currentState?.validate() ?? false)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text("يرجى تعبئة جميع الحقول المطلوبة بشكل صحيح"),
+        ),
+      );
+      return;
+    }
     if (_startLatLng == null ||
         _destLatLng == null ||
         _selectedDate == null ||
         _selectedTime == null ||
         _selectedCar == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text("يرجى تعبئة جميع الحقول المطلوبة")),
+        const SnackBar(
+          content: Text("بيانات الموقع أو الوقت أو السيارة مفقودة"),
+        ),
       );
       return;
     }
-
-    final departure = DateTime(
+    final offeredSeatsCount =
+        _seatLayout
+            .where((s) => s['type'] == 'share' && s['offered'] == true)
+            .length;
+    if (offeredSeatsCount == 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("يرجى عرض مقعد واحد على الأقل للركاب")),
+      );
+      return;
+    }
+    if (_isSubmitting) return;
+    setState(() => _isSubmitting = true);
+    // 2. Handle Gold Cost
+    final bool goldCostCovered = await _handleCreateRideGoldCost();
+    if (!goldCostCovered) {
+      setState(() => _isSubmitting = false);
+      return;
+    }
+    // 3. Fetch Driver Phone
+    String driverPhone = '';
+    final currentUser = _auth.currentUser;
+    if (currentUser != null) {
+      try {
+        final userDoc =
+            await _firestore.collection('users').doc(currentUser.uid).get();
+        if (userDoc.exists)
+          driverPhone = (userDoc.data()?['phone'] as String?) ?? '';
+        if (driverPhone.isEmpty)
+          throw Exception("Driver phone number is missing.");
+      } catch (e) {
+        debugPrint("Error fetching driver phone: $e");
+        if (mounted)
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text("Error fetching driver phone: $e"),
+              backgroundColor: Colors.red,
+            ),
+          );
+        setState(() => _isSubmitting = false);
+        return;
+      }
+    } else {
+      if (mounted)
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("User not logged in."),
+            backgroundColor: Colors.red,
+          ),
+        );
+      setState(() => _isSubmitting = false);
+      return;
+    }
+    // 4. Prepare Ride Data
+    final departureDateTime = DateTime(
       _selectedDate!.year,
       _selectedDate!.month,
       _selectedDate!.day,
       _selectedTime!.hour,
       _selectedTime!.minute,
     );
-
-    String repeat = _repeatOption;
-    List<int>? days;
+    final Timestamp departureTimestamp = Timestamp.fromDate(departureDateTime);
+    String repeatType = _repeatOption;
+    List<int>? repeatDays;
     if (_repeatOption == 'daysOfWeek') {
-      days = [];
+      repeatDays = [];
       for (int i = 0; i < 7; i++) {
-        if (_weekdaySelected[i]) days.add(i);
+        if (_weekdaySelected[i]) repeatDays.add(i);
+      }
+      if (repeatDays.isEmpty) {
+        repeatType = 'once';
+        repeatDays = null;
+        if (mounted)
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text("No repeat days selected, setting ride to 'once'."),
+            ),
+          );
       }
     }
-
     final rideData = {
-      "startLocationName": _startController.text,
+      "startLocationName": _startController.text.trim(),
       "startLocation": GeoPoint(
         _startLatLng!.latitude,
         _startLatLng!.longitude,
       ),
-      "endLocationName": _destController.text,
+      "endLocationName": _destController.text.trim(),
       "endLocation": GeoPoint(_destLatLng!.latitude, _destLatLng!.longitude),
-      "date": Timestamp.fromDate(departure),
-      "repeat": repeat,
-      if (days != null) "days": days,
+      "date": departureTimestamp,
+      "repeat": repeatType,
+      if (repeatDays != null) "days": repeatDays,
       "price": double.tryParse(_seatPriceController.text) ?? 0.0,
       "preferences": {"smoking": _smokingAllowed},
       "seatLayout": _seatLayout,
-      "driverId": FirebaseAuth.instance.currentUser?.uid ?? "",
+      "driverId": currentUser?.uid ?? "",
       "carId": _selectedCar!.id,
-      "driverPhone": "",
+      "driverPhone": driverPhone,
       "status": "scheduled",
-      "createdAt": Timestamp.now(),
+      "createdAt": FieldValue.serverTimestamp(),
     };
-
+    // 5. Add Ride & Update Role
     try {
-      final docRef = await FirebaseFirestore.instance
-          .collection("rides")
-          .add(rideData);
-      // Ride created => update user role=driver
-      final currentUser = FirebaseAuth.instance.currentUser;
-      if (currentUser != null) {
-        await FirebaseFirestore.instance
-            .collection('users')
-            .doc(currentUser.uid)
-            .update({"role": "driver"});
+      await _firestore.collection("rides").add(rideData);
+      if (_currentUserRole != "driver" && currentUser != null) {
+        await _firestore.collection('users').doc(currentUser.uid).update({
+          "role": "driver",
+        });
       }
-
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text("تم إنشاء الرحلة بنجاح")));
-      Navigator.pop(context);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text("تم إنشاء الرحلة بنجاح"),
+            backgroundColor: Colors.green,
+          ),
+        );
+        Navigator.pop(context);
+      }
     } catch (e) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text("خطأ أثناء إنشاء الرحلة: $e")));
+      debugPrint("Error creating ride: $e");
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text("خطأ أثناء إنشاء الرحلة: $e"),
+            backgroundColor: Colors.red,
+          ),
+        );
+        _fetchUserData();
+      }
+    } // Consider refunding gold
+    finally {
+      if (mounted) setState(() => _isSubmitting = false);
     }
   }
 
+  // --- Build Methods ---
   @override
   Widget build(BuildContext context) {
-    // If still checking role or fetching cars => show loader
-    if (_isLoading || _isCheckingRole) {
+    if (_isLoading)
       return Scaffold(
         appBar: AppBar(title: const Text("إنشاء رحلة")),
         body: const Center(child: CircularProgressIndicator()),
+        bottomNavigationBar: _buildBottomNavigationBar(),
       );
-    }
-
+    if (!_allowCreateRide)
+      return Scaffold(
+        appBar: AppBar(title: const Text("إنشاء رحلة")),
+        body: _buildBlockedUi(),
+        bottomNavigationBar: _buildBottomNavigationBar(),
+      );
     return Scaffold(
       appBar: AppBar(
         title: const Text("إنشاء رحلة"),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.directions_car),
-            tooltip: "إضافة سيارة",
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(builder: (ctx) => add_car.AddCarPage()),
-              ).then((_) {
-                _fetchUserCars();
-              });
-            },
+          Padding(
+            padding: const EdgeInsets.only(right: 12.0),
+            child: Chip(
+              avatar: Icon(
+                Icons.monetization_on,
+                color: Colors.yellow.shade700,
+                size: 18,
+              ),
+              label: Text(
+                '$_userGold',
+                style: const TextStyle(fontWeight: FontWeight.bold),
+              ),
+              backgroundColor: Colors.white,
+              side: BorderSide(color: Colors.grey.shade300),
+            ),
           ),
         ],
       ),
-      body: _allowCreateRide ? _buildRideForm() : _buildBlockedUi(),
+      body: _buildRideForm(),
+      bottomNavigationBar: _buildBottomNavigationBar(),
     );
   }
 
-  /// If user is blocked from creating, show a message
   Widget _buildBlockedUi() {
     String reason = "لا يمكنك إنشاء رحلة الآن.";
-    if (_currentUserRole == "passenger") {
-      reason = "أنت راكب في رحلة أخرى حالياً. لا يمكنك إنشاء رحلة.";
-    } else if (_currentUserRole == "driver") {
-      reason = "لديك رحلة نشطة بالفعل. أنهيها قبل إنشاء رحلة جديدة.";
-    }
+    if (_currentUserRole == "passenger")
+      reason = "أنت راكب حالياً ولا يمكنك إنشاء رحلة جديدة.";
+    else if (_currentUserRole == "driver" && !_allowCreateRide)
+      reason = "لديك رحلة نشطة بالفعل. أنهِ رحلتك الحالية أولاً.";
+    else if (_cars.isEmpty)
+      reason = "يجب إضافة سيارة أولاً قبل إنشاء رحلة.";
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(24.0),
-        child: Text(reason, style: const TextStyle(fontSize: 16)),
-      ),
-    );
-  }
-
-  /// The actual form if user is allowed
-  Widget _buildRideForm() {
-    return SingleChildScrollView(
-      padding: const EdgeInsets.all(16),
-      child: Form(
-        key: _formKey,
         child: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
+          mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            // Start
-            const Text(
-              "نقطة البداية",
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
-            TextFormField(
-              controller: _startController,
-              readOnly: true,
-              decoration: InputDecoration(
-                hintText: "اضغط لاختيار نقطة البداية",
-                suffixIcon: IconButton(
-                  icon: const Icon(Icons.map),
-                  tooltip: "اختر من الخريطة",
-                  onPressed: () => _openLocationPicker(forStart: true),
-                ),
-                border: const OutlineInputBorder(),
-              ),
-              validator:
-                  (value) =>
-                      (value == null || value.isEmpty)
-                          ? "يرجى اختيار نقطة البداية"
-                          : null,
-            ),
+            Icon(Icons.block, color: Colors.red.shade700, size: 60),
             const SizedBox(height: 16),
-            // Destination
-            const Text("الوجهة", style: TextStyle(fontWeight: FontWeight.bold)),
-            TextFormField(
-              controller: _destController,
-              readOnly: true,
-              decoration: InputDecoration(
-                hintText: "اضغط لاختيار الوجهة",
-                suffixIcon: IconButton(
-                  icon: const Icon(Icons.map),
-                  tooltip: "اختر من الخريطة",
-                  onPressed: () => _openLocationPicker(forStart: false),
-                ),
-                border: const OutlineInputBorder(),
+            Text(
+              reason,
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.titleMedium,
+            ),
+            const SizedBox(height: 20),
+            if (_cars.isEmpty)
+              ElevatedButton.icon(
+                // --- Highlight: Required arguments for ElevatedButton.icon ---
+                icon: const Icon(Icons.add),
+                label: const Text('إضافة سيارة'), // Required 'label' is present
+                onPressed:
+                    () => Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => const add_car.AddCarPage(),
+                      ),
+                    ).then(
+                      (_) => _fetchUserCars(),
+                    ), // Required 'onPressed' is present
               ),
-              validator:
-                  (value) =>
-                      (value == null || value.isEmpty)
-                          ? "يرجى اختيار الوجهة"
-                          : null,
-            ),
-            const SizedBox(height: 16),
-            // Seat Price
-            TextFormField(
-              controller: _seatPriceController,
-              decoration: const InputDecoration(
-                labelText: "سعر المقعد",
-                border: OutlineInputBorder(),
-              ),
-              keyboardType: const TextInputType.numberWithOptions(
-                decimal: true,
-              ),
-              validator:
-                  (val) =>
-                      (val == null || val.isEmpty)
-                          ? "يرجى إدخال سعر مقعد"
-                          : null,
-            ),
-            const SizedBox(height: 16),
-            if (_cars.isNotEmpty)
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  const Text(
-                    "اختيار السيارة",
-                    style: TextStyle(fontWeight: FontWeight.bold),
-                  ),
-                  DropdownButtonFormField<DocumentSnapshot>(
-                    decoration: const InputDecoration(
-                      border: OutlineInputBorder(),
-                    ),
-                    value: _selectedCar,
-                    items:
-                        _cars.map((car) {
-                          return DropdownMenuItem<DocumentSnapshot>(
-                            value: car,
-                            child: Text(
-                              "${car['model']} - ${car['plateNumber']}",
-                            ),
-                          );
-                        }).toList(),
-                    onChanged: (newValue) {
-                      if (newValue != null) {
-                        _onCarSelected(newValue);
-                      }
-                    },
-                  ),
-                  const SizedBox(height: 16),
-                ],
-              ),
-            // Smoking
-            Row(
-              children: [
-                const Expanded(
-                  child: Text("يسمح بالتدخين", style: TextStyle(fontSize: 16)),
-                ),
-                IconButton(
-                  icon: Icon(
-                    _smokingAllowed ? Icons.smoking_rooms : Icons.smoke_free,
-                    color: _smokingAllowed ? Colors.green : Colors.red,
-                  ),
-                  onPressed: () {
-                    setState(() {
-                      _smokingAllowed = !_smokingAllowed;
-                    });
-                  },
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            // Date & Time
-            const Text(
-              "موعد المغادرة",
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                Expanded(
-                  child: TextFormField(
-                    controller: _dateController,
-                    readOnly: true,
-                    decoration: InputDecoration(
-                      hintText: "اختر التاريخ",
-                      prefixIcon: const Icon(Icons.date_range),
-                      border: const OutlineInputBorder(),
-                    ),
-                    onTap: _pickDate,
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: TextFormField(
-                    controller: _timeController,
-                    readOnly: true,
-                    decoration: InputDecoration(
-                      hintText: "اختر الوقت",
-                      prefixIcon: const Icon(Icons.access_time),
-                      border: const OutlineInputBorder(),
-                    ),
-                    onTap: _pickTime,
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 16),
-            // Repeat
-            const Text(
-              "التكرار",
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
-            DropdownButtonFormField<String>(
-              decoration: const InputDecoration(border: OutlineInputBorder()),
-              value: _repeatOption,
-              items: const [
-                DropdownMenuItem(value: 'once', child: Text("مرة واحدة")),
-                DropdownMenuItem(value: 'daily', child: Text("يوميًا")),
-                DropdownMenuItem(
-                  value: 'daysOfWeek',
-                  child: Text("تحديد أيام الأسبوع"),
-                ),
-              ],
-              onChanged: (value) {
-                if (value != null) {
-                  setState(() {
-                    _repeatOption = value;
-                  });
-                }
-              },
-            ),
-            if (_repeatOption == 'daysOfWeek') ...[
-              const SizedBox(height: 8),
-              Wrap(
-                spacing: 8,
-                children: List.generate(7, (index) {
-                  const dayNames = [
-                    "الأحد",
-                    "الاثنين",
-                    "الثلاثاء",
-                    "الأربعاء",
-                    "الخميس",
-                    "الجمعة",
-                    "السبت",
-                  ];
-                  return FilterChip(
-                    label: Text(dayNames[index]),
-                    selected: _weekdaySelected[index],
-                    onSelected: (selected) {
-                      setState(() {
-                        _weekdaySelected[index] = selected;
-                      });
-                    },
-                  );
-                }),
-              ),
-            ],
-            const SizedBox(height: 16),
-            // Seat layout
-            const Text(
-              "تخطيط المقاعد",
-              style: TextStyle(fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
-            Directionality(
-              textDirection: TextDirection.ltr,
-              child: _buildSeatLayout(),
-            ),
-            const SizedBox(height: 24),
-            ElevatedButton(
-              onPressed: _submitRide,
-              child: const Text("إنشاء الرحلة", style: TextStyle(fontSize: 16)),
-            ),
           ],
         ),
       ),
     );
   }
-}
 
-// ====================== LocationPickerPage with Integrated Search Bar ======================
-class LocationPickerPage extends StatefulWidget {
-  final LatLng? initialCenter;
-  const LocationPickerPage({this.initialCenter});
-
-  @override
-  _LocationPickerPageState createState() => _LocationPickerPageState();
-}
-
-class _LocationPickerPageState extends State<LocationPickerPage> {
-  final MapController _mapController = MapController();
-  LatLng _center = LatLng(0, 0);
-  LatLng? _pickedLocation;
-  bool _loadingName = false;
-  String? _pickedName;
-  final TextEditingController _searchController = TextEditingController();
-
-  // Holds search results.
-  List<OSMPlace> _searchResults = [];
-
-  @override
-  void initState() {
-    super.initState();
-    if (widget.initialCenter != null) {
-      _center = widget.initialCenter!;
-      _pickedLocation = _center;
-      _fetchLocationName(_center);
-    } else {
-      _initCurrentLocation();
-    }
-  }
-
-  Future<void> _initCurrentLocation() async {
-    try {
-      final pos = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.medium,
-      );
-      setState(() {
-        _center = LatLng(pos.latitude, pos.longitude);
-        _pickedLocation = _center;
-      });
-      _fetchLocationName(_center);
-    } catch (e) {
-      debugPrint("Error getting current location: $e");
-    }
-  }
-
-  Future<List<OSMPlace>> _searchPlaces(String query) async {
-    final url = Uri.parse(
-      "https://nominatim.openstreetmap.org/search?format=json&accept-language=ar&q=$query",
-    );
-    final response = await http.get(
-      url,
-      headers: {"User-Agent": "FlutterRideApp/1.0"},
-    );
-    if (response.statusCode == 200) {
-      final data = json.decode(response.body) as List;
-      return data.map<OSMPlace>((item) {
-        final lat = double.tryParse(item['lat']) ?? 0.0;
-        final lon = double.tryParse(item['lon']) ?? 0.0;
-        return OSMPlace(
-          displayName: item['display_name'],
-          name: item['display_name'],
-          point: LatLng(lat, lon),
-        );
-      }).toList();
-    } else {
-      return [];
-    }
-  }
-
-  Future<void> _fetchLocationName(LatLng point) async {
-    setState(() {
-      _loadingName = true;
-      _pickedName = null;
-    });
-    final url = Uri.parse(
-      "https://nominatim.openstreetmap.org/reverse?format=json&lat=${point.latitude}&lon=${point.longitude}&accept-language=ar&addressdetails=1",
-    );
-    try {
-      final response = await http.get(
-        url,
-        headers: {"User-Agent": "FlutterRideApp/1.0"},
-      );
-      if (response.statusCode == 200) {
-        final data = json.decode(utf8.decode(response.bodyBytes));
-        final displayName = data['display_name'] ?? "";
-        setState(() {
-          _pickedName = displayName.split(',')[0];
-        });
-      }
-    } catch (e) {
-      debugPrint("Error fetching location name: $e");
-    } finally {
-      setState(() {
-        _loadingName = false;
-      });
-    }
-  }
-
-  void _onMapTap(TapPosition tapPos, LatLng latlng) {
-    setState(() {
-      _pickedLocation = latlng;
-      _searchResults.clear();
-      _searchController.clear();
-    });
-    _fetchLocationName(latlng);
-  }
-
-  void _confirmLocation() {
-    if (_pickedLocation != null && _pickedName != null) {
-      Navigator.pop(context, {
-        "lat": _pickedLocation!.latitude,
-        "lon": _pickedLocation!.longitude,
-        "name": _pickedName!,
-      });
-    } else {
-      Navigator.pop(context);
-    }
-  }
-
-  void _onSearchChanged(String query) async {
-    if (query.isEmpty) {
-      setState(() {
-        _searchResults.clear();
-      });
-      return;
-    }
-    final results = await _searchPlaces(query);
-    setState(() {
-      _searchResults = results;
-    });
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text("اختر الموقع على الخريطة")),
-      body: Stack(
-        children: [
-          FlutterMap(
-            mapController: _mapController,
-            options: MapOptions(
-              initialCenter: _center,
-              initialZoom: 13.0,
-              onTap: _onMapTap,
-            ),
-            children: [
-              TileLayer(
-                urlTemplate: "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-                subdomains: ['a', 'b', 'c'],
+  Widget _buildRideForm() {
+    // Main form structure using Cards
+    return SingleChildScrollView(
+      padding: const EdgeInsets.all(16.0),
+      child: Form(
+        key: _formKey,
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Card(
+              // Location Card
+              elevation: 2,
+              margin: const EdgeInsets.only(bottom: 16),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
               ),
-              if (_pickedLocation != null)
-                MarkerLayer(
-                  markers: [
-                    Marker(
-                      point: _pickedLocation!,
-                      width: 40,
-                      height: 40,
-                      child: const Icon(
-                        Icons.location_pin,
-                        color: Colors.red,
-                        size: 40,
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      "المسار",
+                      style: Theme.of(context).textTheme.titleLarge,
+                    ),
+                    const SizedBox(height: 16),
+                    TextFormField(
+                      controller: _startController,
+                      readOnly: true,
+                      decoration: InputDecoration(
+                        labelText: "نقطة البداية",
+                        hintText: "اضغط لاختيار نقطة البداية",
+                        prefixIcon: Icon(
+                          Icons.trip_origin,
+                          color: Colors.green.shade700,
+                        ),
+                        suffixIcon: IconButton(
+                          icon: const Icon(Icons.map_outlined),
+                          tooltip: "اختر من الخريطة",
+                          onPressed: () => _openLocationPicker(forStart: true),
+                        ),
+                        border: const OutlineInputBorder(),
                       ),
+                      validator:
+                          (value) =>
+                              (value == null || value.isEmpty)
+                                  ? "يرجى اختيار نقطة البداية"
+                                  : null,
+                      onTap: () => _openLocationPicker(forStart: true),
+                    ),
+                    const SizedBox(height: 12),
+                    TextFormField(
+                      controller: _destController,
+                      readOnly: true,
+                      decoration: InputDecoration(
+                        labelText: "الوجهة",
+                        hintText: "اضغط لاختيار الوجهة",
+                        prefixIcon: Icon(
+                          Icons.location_on,
+                          color: Colors.red.shade700,
+                        ),
+                        suffixIcon: IconButton(
+                          icon: const Icon(Icons.map_outlined),
+                          tooltip: "اختر من الخريطة",
+                          onPressed: () => _openLocationPicker(forStart: false),
+                        ),
+                        border: const OutlineInputBorder(),
+                      ),
+                      validator:
+                          (value) =>
+                              (value == null || value.isEmpty)
+                                  ? "يرجى اختيار الوجهة"
+                                  : null,
+                      onTap: () => _openLocationPicker(forStart: false),
+                    ),
+                    if (_startLatLng != null || _destLatLng != null) ...[
+                      const SizedBox(height: 16),
+                      Container(
+                        height: 150,
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: Colors.grey.shade300),
+                        ),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: FlutterMap(
+                            options: MapOptions(
+                              initialCenter:
+                                  _startLatLng ??
+                                  _destLatLng ??
+                                  LatLng(36.8, 10.18),
+                              initialZoom: 11.0,
+                              interactionOptions: const InteractionOptions(
+                                flags: InteractiveFlag.none,
+                              ),
+                            ),
+                            children: [
+                              TileLayer(
+                                urlTemplate:
+                                    "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+                              ),
+                              MarkerLayer(
+                                markers: [
+                                  if (_startLatLng != null)
+                                    Marker(
+                                      point: _startLatLng!,
+                                      width: 30,
+                                      height: 30,
+                                      alignment: Alignment.topCenter,
+                                      child: Icon(
+                                        Icons.trip_origin,
+                                        color: Colors.green.shade700,
+                                        size: 30,
+                                      ),
+                                    ),
+                                  if (_destLatLng != null)
+                                    Marker(
+                                      point: _destLatLng!,
+                                      width: 30,
+                                      height: 30,
+                                      alignment: Alignment.topCenter,
+                                      child: Icon(
+                                        Icons.location_on,
+                                        color: Colors.red.shade700,
+                                        size: 30,
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            Card(
+              // Date, Time, Repetition Card
+              elevation: 2,
+              margin: const EdgeInsets.only(bottom: 16),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      "الوقت والتكرار",
+                      style: Theme.of(context).textTheme.titleLarge,
+                    ),
+                    const SizedBox(height: 16),
+                    Row(
+                      children: [
+                        Expanded(
+                          child: TextFormField(
+                            controller: _dateController,
+                            readOnly: true,
+                            decoration: const InputDecoration(
+                              labelText: "التاريخ",
+                              hintText: "اختر التاريخ",
+                              prefixIcon: Icon(Icons.date_range),
+                              border: OutlineInputBorder(),
+                            ),
+                            onTap: _pickDate,
+                            validator:
+                                (v) =>
+                                    (v == null || v.isEmpty)
+                                        ? 'حدد التاريخ'
+                                        : null,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: TextFormField(
+                            controller: _timeController,
+                            readOnly: true,
+                            decoration: const InputDecoration(
+                              labelText: "الوقت",
+                              hintText: "اختر الوقت",
+                              prefixIcon: Icon(Icons.access_time),
+                              border: OutlineInputBorder(),
+                            ),
+                            onTap: _pickTime,
+                            validator:
+                                (v) =>
+                                    (v == null || v.isEmpty)
+                                        ? 'حدد الوقت'
+                                        : null,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    DropdownButtonFormField<String>(
+                      // Repeat Dropdown
+                      decoration: const InputDecoration(
+                        labelText: "التكرار",
+                        border: OutlineInputBorder(),
+                      ),
+                      value: _repeatOption,
+                      // --- Highlight: Required arguments for DropdownButtonFormField ---
+                      items: const [
+                        // Required 'items' is present
+                        DropdownMenuItem(
+                          value: 'once',
+                          child: Text("مرة واحدة"),
+                        ),
+                        DropdownMenuItem(value: 'daily', child: Text("يوميًا")),
+                        DropdownMenuItem(
+                          value: 'daysOfWeek',
+                          child: Text("تحديد أيام الأسبوع"),
+                        ),
+                      ],
+                      onChanged: (value) {
+                        // Required 'onChanged' is present
+                        if (value != null && mounted)
+                          setState(() => _repeatOption = value);
+                      },
+                    ),
+                    if (_repeatOption == 'daysOfWeek') ...[
+                      const SizedBox(height: 12),
+                      Wrap(
+                        spacing: 8.0,
+                        runSpacing: 4.0,
+                        children: List.generate(7, (index) {
+                          const dayNames = [
+                            "الأحد",
+                            "الاثنين",
+                            "الثلاثاء",
+                            "الأربعاء",
+                            "الخميس",
+                            "الجمعة",
+                            "السبت",
+                          ];
+                          int weekdayIndex = index;
+                          return FilterChip(
+                            label: Text(dayNames[weekdayIndex]),
+                            selected: _weekdaySelected[weekdayIndex],
+                            onSelected: (selected) {
+                              setState(
+                                () => _weekdaySelected[weekdayIndex] = selected,
+                              );
+                            },
+                            selectedColor: Colors.green.shade100,
+                            checkmarkColor: Colors.green.shade800,
+                          );
+                        }),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+            ),
+            Card(
+              // Car & Seats Card
+              elevation: 2,
+              margin: const EdgeInsets.only(bottom: 16),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Text(
+                          "السيارة والمقاعد",
+                          style: Theme.of(context).textTheme.titleLarge,
+                        ),
+                        TextButton.icon(
+                          // --- Highlight: Required arguments for TextButton.icon ---
+                          icon: const Icon(Icons.add, size: 18),
+                          label: const Text(
+                            "إضافة سيارة",
+                          ), // Required 'label' is present
+                          onPressed:
+                              () => Navigator.push(
+                                context,
+                                MaterialPageRoute(
+                                  builder: (_) => const add_car.AddCarPage(),
+                                ),
+                              ).then(
+                                (_) => _fetchUserCars(),
+                              ), // Required 'onPressed' is present
+                          style: TextButton.styleFrom(padding: EdgeInsets.zero),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    if (_cars.isNotEmpty)
+                      DropdownButtonFormField<DocumentSnapshot>(
+                        // Car Dropdown
+                        decoration: const InputDecoration(
+                          labelText: "اختيار السيارة",
+                          border: OutlineInputBorder(),
+                        ),
+                        value: _selectedCar,
+                        // --- Highlight: Required arguments for DropdownButtonFormField ---
+                        items:
+                            _cars.map((car) {
+                              // Required 'items' is present
+                              final carData =
+                                  car.data() as Map<String, dynamic>? ?? {};
+                              return DropdownMenuItem<DocumentSnapshot>(
+                                value: car,
+                                child: Text(
+                                  "${carData['brand']} ${carData['model']} - ${carData['plateNumber']}",
+                                ),
+                              );
+                            }).toList(),
+                        onChanged:
+                            _onCarSelected, // Required 'onChanged' is present
+                        validator: (val) => val == null ? 'اختر سيارة' : null,
+                      )
+                    else
+                      const Text(
+                        "لم يتم العثور على سيارات. يرجى إضافة سيارة أولاً.",
+                        style: TextStyle(color: Colors.red),
+                      ),
+                    const SizedBox(height: 20),
+                    const Text(
+                      "تحديد المقاعد المعروضة للركاب:",
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+                    const SizedBox(height: 12),
+                    // Use the Reusable SeatLayoutWidget
+                    if (_selectedCar != null)
+                      SeatLayoutWidget(
+                        key: ValueKey(_selectedCar!.id),
+                        seatCount: _carSeats,
+                        seatLayoutData: _seatLayout,
+                        mode: SeatLayoutMode.driverOffer,
+                        driverSeatAssetPath: _driverSeatImagePath,
+                        passengerSeatAssetPath: _passengerSeatImagePath,
+                        onSeatOfferedToggle: (seatIndex) {
+                          setState(() {
+                            final index = _seatLayout.indexWhere(
+                              (s) => s['seatIndex'] == seatIndex,
+                            );
+                            if (index != -1 &&
+                                _seatLayout[index]['type'] == 'share') {
+                              bool currentStatus =
+                                  _seatLayout[index]['offered'] ?? false;
+                              _seatLayout[index]['offered'] = !currentStatus;
+                            }
+                          });
+                        },
+                      )
+                    else
+                      const Padding(
+                        padding: EdgeInsets.symmetric(vertical: 8.0),
+                        child: Text("اختر سيارة لعرض المقاعد."),
+                      ),
+                    const SizedBox(height: 20),
+                    TextFormField(
+                      controller: _seatPriceController,
+                      decoration: const InputDecoration(
+                        labelText: "سعر المقعد الواحد (DZD)",
+                        prefixIcon: Icon(Icons.attach_money),
+                        border: OutlineInputBorder(),
+                      ),
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      validator: (val) {
+                        if (val == null || val.isEmpty)
+                          return "يرجى إدخال سعر المقعد";
+                        if ((double.tryParse(val) ?? -1) < 0)
+                          return "أدخل سعرًا صالحًا";
+                        return null;
+                      },
                     ),
                   ],
                 ),
-            ],
-          ),
-          // search bar
-          Positioned(
-            top: 10,
-            left: 10,
-            right: 10,
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8),
-              decoration: BoxDecoration(
-                color: Colors.white70,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: TextField(
-                controller: _searchController,
-                decoration: InputDecoration(
-                  hintText: "ابحث عن موقع...",
-                  border: InputBorder.none,
-                  suffixIcon: IconButton(
-                    icon: const Icon(Icons.clear),
-                    onPressed: () {
-                      _searchController.clear();
-                      setState(() {
-                        _searchResults.clear();
-                      });
-                    },
-                  ),
-                ),
-                onChanged: _onSearchChanged,
               ),
             ),
-          ),
-          if (_searchResults.isNotEmpty)
-            Positioned(
-              top: 60,
-              left: 10,
-              right: 10,
-              child: Container(
-                constraints: const BoxConstraints(maxHeight: 200),
-                decoration: BoxDecoration(
-                  color: Colors.white,
-                  borderRadius: BorderRadius.circular(8),
-                ),
-                child: ListView.builder(
-                  shrinkWrap: true,
-                  itemCount: _searchResults.length,
-                  itemBuilder: (context, index) {
-                    final suggestion = _searchResults[index];
-                    return ListTile(
-                      title: Text(
-                        suggestion.displayName,
-                        style: const TextStyle(fontSize: 12),
+            Card(
+              // Preferences Card
+              elevation: 2,
+              margin: const EdgeInsets.only(bottom: 24),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(16.0),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      "التفضيلات",
+                      style: Theme.of(context).textTheme.titleLarge,
+                    ),
+                    const SizedBox(height: 8),
+                    SwitchListTile(
+                      // Smoking Preference
+                      title: const Text("السماح بالتدخين"),
+                      // --- Highlight: Required arguments for SwitchListTile ---
+                      value: _smokingAllowed, // Required 'value' is present
+                      onChanged:
+                          (value) => setState(
+                            () => _smokingAllowed = value,
+                          ), // Required 'onChanged' is present
+                      secondary: Icon(
+                        _smokingAllowed
+                            ? Icons.smoking_rooms
+                            : Icons.smoke_free,
                       ),
-                      onTap: () {
-                        setState(() {
-                          _pickedLocation = suggestion.point;
-                          _center = suggestion.point;
-                          _mapController.move(suggestion.point, 13.0);
-                          _searchController.text = suggestion.displayName;
-                          _searchResults.clear();
-                        });
-                        _fetchLocationName(suggestion.point);
-                      },
-                    );
-                  },
+                      activeColor: Colors.green,
+                    ),
+                  ],
                 ),
               ),
             ),
-          // city name
-          Positioned(
-            top: 270,
-            left: 10,
-            right: 10,
-            child: Container(
-              padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
-              decoration: BoxDecoration(
-                color: Colors.white70,
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Center(
-                child:
-                    _loadingName
-                        ? const Text("جارٍ تحديد اسم الموقع...")
-                        : Text(
-                          _pickedName ?? "اضغط على الخريطة لاختيار موقع",
-                          textAlign: TextAlign.center,
-                          style: const TextStyle(fontSize: 14),
+            ElevatedButton.icon(
+              // Submit Button
+              // --- Highlight: Required arguments for ElevatedButton.icon ---
+              onPressed:
+                  _isSubmitting
+                      ? null
+                      : _submitRide, // Required 'onPressed' is present
+              icon:
+                  _isSubmitting
+                      ? Container(
+                        width: 24,
+                        height: 24,
+                        padding: const EdgeInsets.all(2.0),
+                        child: const CircularProgressIndicator(
+                          color: Colors.white,
+                          strokeWidth: 3,
                         ),
-              ),
-            ),
-          ),
-          Positioned(
-            bottom: 20,
-            left: 20,
-            right: 20,
-            child: ElevatedButton.icon(
-              onPressed: _confirmLocation,
-              icon: const Icon(Icons.check),
-              label: const Text("تأكيد الموقع"),
+                      )
+                      : const Icon(
+                        Icons.add_road,
+                      ), // Required 'icon' is present
+              label: Text(
+                _isSubmitting
+                    ? "جارٍ الإنشاء..."
+                    : "إنشاء الرحلة (تكلفة: $_createRideCost ذهب)",
+                style: const TextStyle(fontSize: 16),
+              ), // Required 'label' is present
               style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.green.shade700,
+                foregroundColor: Colors.white,
                 padding: const EdgeInsets.symmetric(vertical: 14),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(12),
+                ),
               ),
             ),
-          ),
-        ],
+            const SizedBox(height: 16),
+          ],
+        ),
       ),
     );
   }
-}
+
+  // --- REMOVED Seat Layout Builders ---
+
+  Widget _buildBottomNavigationBar() {
+    return BottomNavigationBar(
+      currentIndex: _currentIndex,
+      onTap: _onBottomNavTapped,
+      selectedItemColor: Colors.green.shade800,
+      unselectedItemColor: Colors.grey.shade600,
+      selectedLabelStyle: const TextStyle(
+        fontWeight: FontWeight.bold,
+        fontSize: 11,
+      ),
+      unselectedLabelStyle: const TextStyle(fontSize: 10),
+      type: BottomNavigationBarType.fixed,
+      backgroundColor: Colors.white,
+      elevation: 8.0,
+      items: const [
+        BottomNavigationBarItem(icon: Icon(Icons.home_filled), label: 'Home'),
+        BottomNavigationBarItem(
+          icon: Icon(Icons.directions_car_outlined),
+          label: 'My Rides',
+        ),
+        BottomNavigationBarItem(
+          icon: Icon(Icons.car_rental_outlined),
+          label: 'My Cars',
+        ),
+        BottomNavigationBarItem(
+          icon: Icon(Icons.message_outlined),
+          label: 'Messages',
+        ),
+        BottomNavigationBarItem(
+          icon: Icon(Icons.person_outline),
+          label: 'Account',
+        ),
+      ],
+    );
+  }
+
+  void _onBottomNavTapped(int index) {
+    if (!mounted || index == _currentIndex) return;
+    // TODO: Add form dirty check
+    _navigateToIndex(index);
+  }
+
+  void _navigateToIndex(int index) {
+    Widget? targetPage;
+    bool removeUntil = false;
+    final currentUser = _auth.currentUser;
+    if (currentUser == null) {
+      /* handle error */
+      return;
+    }
+    switch (index) {
+      case 0:
+        targetPage = HomePage(user: currentUser);
+        removeUntil = true;
+        break;
+      case 1:
+        targetPage = MyRidePage(user: currentUser);
+        break;
+      case 2:
+        targetPage = const MyCarsPage();
+        break;
+      case 3:
+        targetPage = const ChatListPage();
+        break;
+      case 4:
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Account page not implemented yet.')),
+        );
+        return;
+    }
+    // --- Includes FIX: Check if targetPage is not null before navigating ---
+    if (targetPage != null) {
+      if (removeUntil) {
+        Navigator.pushAndRemoveUntil(
+          context,
+          MaterialPageRoute(builder: (_) => targetPage!),
+          (route) => false,
+        );
+      } else {
+        Navigator.push(context, MaterialPageRoute(builder: (_) => targetPage!));
+      }
+      if (mounted && !removeUntil) {
+        setState(() => _currentIndex = index);
+      }
+    } else {
+      print("Error: Target page was null for index $index");
+    }
+  }
+} // End of _CreateRidePageState class
+
+// --- Add these dependencies to your pubspec.yaml ---
+// dependencies:
+//   flutter:
+//     sdk: flutter
+//   firebase_core: ^...
+//   firebase_auth: ^...
+//   cloud_firestore: ^...
+//   google_mobile_ads: ^... # Ensure this is added
+//   http: ^...             # For Nominatim API calls
+//   geolocator: ^...       # For current location
+//   flutter_map: ^...      # For map display
+//   latlong2: ^...         # LatLng class for flutter_map
+//   intl: ^...             # For date/time formatting
+//   # Add other necessary dependencies
+
+// --- Asset Setup (IMPORTANT) ---
+// 1. Create folder: `assets/images/` in your project root (if it doesn't exist).
+// 2. Add Images: Copy `DRIVERSEAT.png` and `PASSENGER SEAT.png` (use correct names/extensions!) into `assets/images/`.
+// 3. Declare in pubspec.yaml:
+//    flutter:
+//      uses-material-design: true
+//      assets:
+//        - assets/images/ # Make sure this line exists and is correctly indented
+
+// --- Firestore Setup ---
+// * Ensure 'users' collection has: 'gold' (Number), 'rewardedAdTimestamps' (Array<Timestamp>), 'phone' (String), 'role' (String)
+// * Ensure 'cars' collection has: 'ownerId' (String), 'seatCount' (Number), etc.
+// * Ensure 'rides' collection schema matches the data being saved in `_submitRide`.
+
+// --- Important Notes ---
+// * SeatLayoutWidget: This code now IMPORTS and USES 'widgets/seat_layout_widget.dart'.
+//   Make sure you have created that file with the code from the previous response.
+// * Booking Cost (2 Gold): The logic to check/deduct gold for BOOKING a seat
+//   still needs to be implemented in your `RideDetailPage`. You can reuse the
+//   `SeatLayoutWidget` there in `SeatLayoutMode.passengerSelect` mode.

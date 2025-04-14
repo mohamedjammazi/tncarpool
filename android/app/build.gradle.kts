@@ -7,13 +7,14 @@ plugins {
 
 android {
     namespace = "com.example.carpooling_app"
-    compileSdk = 35 // ✅ Set a fixed value or use `flutter.compileSdkVersion`
+    compileSdk = 35
 
     ndkVersion = "27.0.12077973"
 
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_11
         targetCompatibility = JavaVersion.VERSION_11
+        isCoreLibraryDesugaringEnabled = true // ✅ Enable desugaring
     }
 
     kotlinOptions {
@@ -22,10 +23,10 @@ android {
 
     defaultConfig {
         applicationId = "com.example.carpooling_app"
-        minSdk = 24 // ✅ Correct syntax
-        targetSdk = 35 // ✅ Set a fixed value or use `flutter.targetSdkVersion`
-        versionCode = 1 // ✅ Set an integer
-        versionName = "1.0.0" // ✅ Set a string
+        minSdk = 24
+        targetSdk = 35
+        versionCode = 1
+        versionName = "1.0.0"
     }
 
     buildTypes {
@@ -34,6 +35,11 @@ android {
         }
     }
 }
+
+dependencies {
+    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4") // ✅ Required
+}
+
 
 flutter {
     source = "../.."
